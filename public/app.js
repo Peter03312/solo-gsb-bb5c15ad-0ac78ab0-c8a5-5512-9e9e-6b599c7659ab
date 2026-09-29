@@ -54,6 +54,7 @@
     candidates: [],    // 敏感信息巡检候选（随原稿一次性离线扫描，detectSensitive 结果）
     inspect: [],       // 候选依据最新映射判定后的结果（每次渲染重算，含 cid/status/leakRanges）
     inspectFilter: 'all', // 巡检侧栏状态筛选：all / leaking / kept / anonymized
+    inspectReport: null, // 巡检报告快照：每次渲染随同一份 map/preview/inspect 重建，导出只读取快照
     citations: [],     // 引文：{ id, start, end } 原稿非空半开区间（按添加顺序），引文正文每次渲染重算
     reviewApprovals: {}, // 复核确认记录：key(原稿区间:人物ID:代号文本) -> { start, end, personId, codename }
     reviewList: []     // 当前复核清单（每次渲染按最终映射重建，项含 key/mid/区间/代号/来源/approved）
@@ -73,6 +74,7 @@
   var personForm = $('personForm'), codenameInput = $('codenameInput'), aliasesInput = $('aliasesInput');
   var personList = $('personList'), exceptionList = $('exceptionList'), statsEl = $('stats');
   var inspectFilters = $('inspectFilters'), inspectList = $('inspectList');
+  var btnExportInspect = $('btnExportInspect');
   var rulingList = $('rulingList');
   var mappingBody = document.querySelector('#mappingTable tbody');
   var selPopup = $('selPopup'), popupPerson = $('popupPerson'), popupNewFields = $('popupNewFields');
@@ -286,11 +288,48 @@
     });
   }
 
+  // 巡检报告快照：必须与本次渲染使用同一份 map / preview / inspect 结果，
+  // 规则、框选、例外、裁决、人物合并或原稿变化后 render() 都会重建快照，
+  // 导出时只读取快照，绝不与导出后新编辑的状态混用。
+  // 逐项记录候选类型、原稿半开区间、原文片段、当前状态与仍泄漏子区间；
+  // 候选在预览上的投影非空时同时记录预览区间（投影算法与预览下划线标记
+  // projectCandidatesToPreview 一致，但不合并相邻候选）。
+  function buildInspectReportSnapshot(map, preview) {
+    var counts = inspectCounts();
+    var previewLen = preview.length;
+    var items = state.inspect.map(function (c) {
+      var item = {
+        type: c.type,
+        originalRange: [c.start, c.end],
+        snippet: state.text.slice(c.start, c.end),
+        status: c.status,
+        leakRanges: c.leakRanges.map(function (r) { return [r[0], r[1]]; })
+      };
+      var ps = origOffsetToPreview(c.start, map, previewLen);
+      var pe = origOffsetToPreview(c.end, map, previewLen);
+      if (pe <= ps) pe = ps + 1; // 与预览标记一致：投影整体收敛时保留 1 字符锚点
+      if (ps >= 0 && pe > ps && pe <= previewLen) item.previewRange = [ps, pe];
+      return item;
+    });
+    state.inspectReport = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      counts: {
+        all: counts.all,
+        leaking: counts.leaking,
+        kept: counts.kept,
+        anonymized: counts.anonymized
+      },
+      items: items
+    };
+  }
+
   function render() {
     var result = anonymize();
     state.currentPreview = result.preview;
     state.currentMap = result.map;
     computeInspect(result.map);
+    buildInspectReportSnapshot(result.map, result.preview);
     rebuildReviews(result.map);
 
     // 当前仍在预览中生效的例外（未被显式框选完全覆盖）
@@ -459,6 +498,13 @@
 
   function renderInspect() {
     var counts = inspectCounts();
+    // 无候选时禁用导出；筛选下暂无候选仍可导出（报告 items 为空数组）
+    btnExportInspect.disabled = state.inspect.length === 0;
+    var currentFilter = INSPECT_FILTERS.filter(function (f) { return f.key === state.inspectFilter; })[0];
+    btnExportInspect.title = '按当前筛选（' + (currentFilter ? currentFilter.label : '全部') +
+      '）导出同一次渲染快照的 UTF-8 JSON 报告\n' +
+      '逐项含候选类型、原稿半开区间、原文片段、当前状态与仍泄漏子区间；存在预览投影时附预览区间\n' +
+      '规则或原稿变化后自动重新生成；下载失败不改变编辑状态';
     inspectFilters.innerHTML = '';
     INSPECT_FILTERS.forEach(function (f) {
       var btn = document.createElement('button');
@@ -576,6 +622,57 @@
     state.history.push({ type: 'inspectAssign', selections: added });
     render();
     toast('已把「' + c.value + '」的 ' + added.length + ' 段泄漏内容指派给「' + p.codename + '」，可撤销');
+  }
+
+  var INSPECT_REPORT_NAME = {
+    all: '全部', leaking: '仍泄漏', kept: '保留原文', anonymized: '已匿名'
+  };
+
+  // 导出当前筛选状态下的 UTF-8 JSON 巡检报告。
+  // 报告项来自 render() 冻结的同一次渲染快照（state.inspectReport），按当前筛选过滤；
+  // 规则或原稿变化后 render() 已重建快照，因此永远不会导出过期数据。
+  // 无候选时按钮已禁用（此处兜底）；任何失败只提示、不触碰编辑状态。
+  function exportInspectReport() {
+    var snapshot = state.inspectReport;
+    if (!snapshot || !snapshot.items.length) return;
+    var filter = state.inspectFilter;
+    var rows = snapshot.items.filter(function (c) {
+      return filter === 'all' || c.status === filter;
+    });
+    var blob = null, url = null;
+    try {
+      var report = {
+        version: snapshot.version,
+        generatedAt: snapshot.generatedAt,
+        filter: filter,
+        filterLabel: INSPECT_REPORT_NAME[filter] || filter,
+        total: snapshot.counts.all,
+        counts: {
+          all: snapshot.counts.all,
+          leaking: snapshot.counts.leaking,
+          kept: snapshot.counts.kept,
+          anonymized: snapshot.counts.anonymized
+        },
+        exportedCount: rows.length,
+        items: rows
+      };
+      blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json;charset=utf-8' });
+      url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'sensitive-report.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+      toast('已导出巡检报告 sensitive-report.json（UTF-8，' + rows.length + ' 项，' +
+        (INSPECT_REPORT_NAME[filter] || filter) + '）');
+    } catch (e) {
+      if (url) {
+        try { URL.revokeObjectURL(url); } catch (e2) { /* 忽略 */ }
+      }
+      toast('巡检报告导出失败，编辑状态未改变');
+    }
   }
 
   // 巡检联动：原稿与预览中同步高亮该候选，并联动侧栏条目
@@ -1059,6 +1156,7 @@
     citSeq = maxIdPlusOne(state.citations);
     state.candidates = Anonymizer.detectSensitive(state.text); // 巡检候选随原稿重新离线扫描
     state.inspect = [];
+    state.inspectReport = null;
     state.inspectFilter = 'all';
     activeCid = null;
     closePopup();
@@ -1869,6 +1967,8 @@
     downloadCitations(state.currentMap);
   });
 
+  btnExportInspect.addEventListener('click', exportInspectReport);
+
   $('btnDownloadDelivery').addEventListener('click', downloadDelivery);
 
   $('batchConfirm').addEventListener('click', confirmBatch);
@@ -1930,6 +2030,7 @@
     state.reviewList = [];
     state.candidates = Anonymizer.detectSensitive(text); // 离线一次性扫描，随规则变化只重判级
     state.inspect = [];
+    state.inspectReport = null;
     state.inspectFilter = 'all';
     activeCid = null;
     closeMergeDialog();
@@ -1965,6 +2066,7 @@
     state.reviewList = [];
     state.candidates = [];
     state.inspect = [];
+    state.inspectReport = null;
     state.inspectFilter = 'all';
     activeCid = null;
   });
