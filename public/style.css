@@ -279,6 +279,8 @@ body {
 
 /* 敏感信息巡检 */
 .inspect-filters { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+.inspect-export { margin: 0 0 8px; }
+.inspect-export .btn-mini { width: 100%; padding: 3px 8px; }
 .inspect-filter {
   border: 1px solid #d0d7de;
   background: #fff;

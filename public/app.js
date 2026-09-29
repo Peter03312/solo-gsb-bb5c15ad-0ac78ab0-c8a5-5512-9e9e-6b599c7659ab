@@ -54,6 +54,7 @@
     candidates: [],    // 敏感信息巡检候选（随原稿一次性离线扫描，detectSensitive 结果）
     inspect: [],       // 候选依据最新映射判定后的结果（每次渲染重算，含 cid/status/leakRanges）
     inspectFilter: 'all', // 巡检侧栏状态筛选：all / leaking / kept / anonymized
+    inspectReport: null, // 最近一次渲染（或筛选切换）快照对应的巡检报告导出对象，仅由 renderInspect 重建
     citations: [],     // 引文：{ id, start, end } 原稿非空半开区间（按添加顺序），引文正文每次渲染重算
     reviewApprovals: {}, // 复核确认记录：key(原稿区间:人物ID:代号文本) -> { start, end, personId, codename }
     reviewList: []     // 当前复核清单（每次渲染按最终映射重建，项含 key/mid/区间/代号/来源/approved）
@@ -252,16 +253,22 @@
     return previewLen - (state.text.length - off); // 末段空隙
   }
 
+  // 把单个巡检候选投影到预览：返回该候选自身的原始投影段（未合并、未退化），
+  // 供渲染标记合并与巡检报告快照共用，保证两者来自同一次渲染。
+  // 已被整体替换时 [ps,pe) 可能退化为空区间（pe===ps，即代号位置）。
+  function projectCandidateSegment(c, map, previewLen) {
+    var ps = origOffsetToPreview(c.start, map, previewLen);
+    var pe = origOffsetToPreview(c.end, map, previewLen);
+    return { start: ps, end: pe, status: c.status, cid: c.cid };
+  }
+
   // 把巡检候选投影到预览：已匿名处收敛为代号位置，其余按原长度投影，
   // 合并重叠/相邻的投影段并取最高严重级（leaking＞kept＞anonymized）
   function projectCandidatesToPreview(cands, map, previewLen) {
     var STATUS_RANK = { leaking: 0, kept: 1, anonymized: 2 };
-    var segs = [];
-    cands.forEach(function (c) {
-      var ps = origOffsetToPreview(c.start, map, previewLen);
-      var pe = origOffsetToPreview(c.end, map, previewLen);
-      if (pe <= ps) pe = ps + 1; // 已被整体替换时退化为代号处的 1 字符标记
-      segs.push({ start: ps, end: pe, status: c.status, cid: c.cid });
+    var segs = cands.map(function (c) { return projectCandidateSegment(c, map, previewLen); });
+    segs.forEach(function (g) {
+      if (g.end <= g.start) g.end = g.start + 1; // 已被整体替换时退化为代号处的 1 字符标记
     });
     segs.sort(function (a, b) { return a.start - b.start || a.end - b.end; });
     var out = [];
@@ -487,76 +494,142 @@
       empty.className = 'inspect-empty';
       empty.textContent = '（原稿中未发现手机号、邮箱或合法身份证号）';
       inspectList.appendChild(empty);
-      return;
-    }
-    if (!rows.length) {
+    } else if (!rows.length) {
       var none = document.createElement('li');
       none.className = 'inspect-empty';
       none.textContent = '（当前筛选下暂无候选）';
       inspectList.appendChild(none);
-      return;
-    }
-    rows.forEach(function (c) {
-      var li = document.createElement('li');
-      li.className = 'inspect-item st-' + c.status + (activeCid === c.cid ? ' inspect-active' : '');
-      li.dataset.cid = c.cid;
+    } else {
+      rows.forEach(function (c) {
+        var li = document.createElement('li');
+        li.className = 'inspect-item st-' + c.status + (activeCid === c.cid ? ' inspect-active' : '');
+        li.dataset.cid = c.cid;
 
-      var row = document.createElement('div');
-      row.className = 'inspect-row';
-      var type = document.createElement('span');
-      type.className = 'inspect-type';
-      type.textContent = INSPECT_TYPE_NAME[c.type];
-      var frag = document.createElement('span');
-      frag.className = 'inspect-frag';
-      frag.textContent = c.value;
-      frag.title = c.value + '\n点击在原稿 / 预览中定位';
-      var st = document.createElement('span');
-      st.className = 'inspect-status';
-      st.textContent = INSPECT_STATUS_NAME[c.status];
-      row.appendChild(type); row.appendChild(frag); row.appendChild(st);
-      li.appendChild(row);
+        var row = document.createElement('div');
+        row.className = 'inspect-row';
+        var type = document.createElement('span');
+        type.className = 'inspect-type';
+        type.textContent = INSPECT_TYPE_NAME[c.type];
+        var frag = document.createElement('span');
+        frag.className = 'inspect-frag';
+        frag.textContent = c.value;
+        frag.title = c.value + '\n点击在原稿 / 预览中定位';
+        var st = document.createElement('span');
+        st.className = 'inspect-status';
+        st.textContent = INSPECT_STATUS_NAME[c.status];
+        row.appendChild(type); row.appendChild(frag); row.appendChild(st);
+        li.appendChild(row);
 
-      var meta = document.createElement('div');
-      meta.className = 'inspect-meta';
-      meta.textContent = '原稿区间 [' + c.start + ', ' + c.end + ')' +
-        (c.status === 'leaking' ? ' ｜ 仍泄漏 ' + c.leakRanges.length + ' 段' : '');
-      li.appendChild(meta);
+        var meta = document.createElement('div');
+        meta.className = 'inspect-meta';
+        meta.textContent = '原稿区间 [' + c.start + ', ' + c.end + ')' +
+          (c.status === 'leaking' ? ' ｜ 仍泄漏 ' + c.leakRanges.length + ' 段' : '');
+        li.appendChild(meta);
 
-      // 单个仍泄漏项：选择已有人物后，按泄漏子区间补显式框选（整次操作一条撤销记录）
-      if (c.status === 'leaking') {
-        var assign = document.createElement('div');
-        assign.className = 'inspect-assign';
-        var select = document.createElement('select');
-        if (!state.persons.length) {
-          var o0 = document.createElement('option');
-          o0.textContent = '（请先在上方添加人物）';
-          select.appendChild(o0);
-          select.disabled = true;
-        } else {
-          state.persons.forEach(function (p) {
-            var o = document.createElement('option');
-            o.value = p.id;
-            o.textContent = p.codename;
-            select.appendChild(o);
-          });
+        // 单个仍泄漏项：选择已有人物后，按泄漏子区间补显式框选（整次操作一条撤销记录）
+        if (c.status === 'leaking') {
+          var assign = document.createElement('div');
+          assign.className = 'inspect-assign';
+          var select = document.createElement('select');
+          if (!state.persons.length) {
+            var o0 = document.createElement('option');
+            o0.textContent = '（请先在上方添加人物）';
+            select.appendChild(o0);
+            select.disabled = true;
+          } else {
+            state.persons.forEach(function (p) {
+              var o = document.createElement('option');
+              o.value = p.id;
+              o.textContent = p.codename;
+              select.appendChild(o);
+            });
+          }
+          var btn = document.createElement('button');
+          btn.className = 'btn btn-mini';
+          btn.textContent = '指派给人物';
+          btn.disabled = !state.persons.length;
+          btn.title = '把仍泄漏的部分补为该人物的显式框选（已被框选覆盖的子区间不重复添加；可撤销）';
+          btn.addEventListener('click', function () { assignLeak(c.cid, Number(select.value)); });
+          assign.appendChild(select);
+          assign.appendChild(btn);
+          li.appendChild(assign);
         }
-        var btn = document.createElement('button');
-        btn.className = 'btn btn-mini';
-        btn.textContent = '指派给人物';
-        btn.disabled = !state.persons.length;
-        btn.title = '把仍泄漏的部分补为该人物的显式框选（已被框选覆盖的子区间不重复添加；可撤销）';
-        btn.addEventListener('click', function () { assignLeak(c.cid, Number(select.value)); });
-        assign.appendChild(select);
-        assign.appendChild(btn);
-        li.appendChild(assign);
-      }
 
-      li.addEventListener('click', function (e) {
-        if (e.target.closest('.inspect-assign')) return; // 操作控件不触发定位
-        activateCandidate(c.cid, true);
+        li.addEventListener('click', function (e) {
+          if (e.target.closest('.inspect-assign')) return; // 操作控件不触发定位
+          activateCandidate(c.cid, true);
+        });
+        inspectList.appendChild(li);
       });
-      inspectList.appendChild(li);
-    });
+    }
+
+    // 导出报告取当前筛选下的条目；无候选时报告置空、按钮禁用。
+    // 报告内容全部来自本次 render 的 state.inspect 与当前映射投影（同一次渲染快照），
+    // 规则 / 框选 / 例外 / 裁决 / 合并或原稿变化触发 render() 后在此整体重新生成。
+    state.inspectReport = state.inspect.length ? buildInspectReport(rows) : null;
+    $('btnDownloadInspect').disabled = !state.inspectReport;
+  }
+
+  // ---------- 敏感信息巡检报告导出（UTF-8 JSON） ----------
+  // 报告按当前筛选状态逐项记录：候选类型、原稿半开区间 [start,end)（UTF-16 码元）、
+  // 原文片段、当前状态与仍泄漏子区间；候选在预览中存在非空投影时同时记录预览区间
+  // （被整体替换、收敛为代号位置的候选投影为空区间，不输出 previewRange）。
+  // 该函数只读取最近一次渲染快照（state.inspect / state.currentMap / state.currentPreview），
+  // 不修改任何编辑状态；下载动作失败也不得改变编辑状态。
+  function buildInspectReport(rows) {
+    var counts = inspectCounts();
+    var previewLen = state.currentPreview.length;
+    return {
+      version: 1,
+      filter: state.inspectFilter,
+      filterLabel: INSPECT_FILTERS.filter(function (f) { return f.key === state.inspectFilter; })
+        .map(function (f) { return f.label; })[0] || state.inspectFilter,
+      totals: {
+        all: counts.all,
+        leaking: counts.leaking,
+        kept: counts.kept,
+        anonymized: counts.anonymized,
+        exported: rows.length
+      },
+      items: rows.map(function (c) {
+        var item = {
+          cid: c.cid,
+          type: c.type,
+          typeLabel: INSPECT_TYPE_NAME[c.type] || c.type,
+          originalRange: { start: c.start, end: c.end },
+          value: c.value,
+          status: c.status,
+          statusLabel: INSPECT_STATUS_NAME[c.status] || c.status,
+          leakRanges: c.leakRanges.map(function (r) { return { start: r[0], end: r[1] }; })
+        };
+        // 预览投影取该候选自身的原始投影（不与相邻候选合并）：仅当投影为非空半开区间时记录
+        var seg = projectCandidateSegment(c, state.currentMap, previewLen);
+        if (seg.end > seg.start) item.previewRange = { start: seg.start, end: seg.end };
+        return item;
+      })
+    };
+  }
+
+  // 下载巡检报告：直接序列化渲染快照中缓存的报告对象（UTF-8 JSON）。
+  // 仅触发浏览器本地 Blob 下载，不读取或修改任何编辑状态；失败时仅提示。
+  function downloadInspectReport() {
+    var report = state.inspectReport;
+    if (!report) return; // 无候选时按钮已禁用，此处兜底
+    try {
+      var blob = new Blob([JSON.stringify(report, null, 2)],
+        { type: 'application/json;charset=utf-8' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'inspect-report.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+      toast('已按当前筛选导出巡检报告 inspect-report.json（来自本次渲染快照，UTF-8 JSON）');
+    } catch (e) {
+      toast('巡检报告导出失败，编辑状态未改变');
+    }
   }
 
   function assignLeak(cid, personId) {
@@ -1870,6 +1943,8 @@
   });
 
   $('btnDownloadDelivery').addEventListener('click', downloadDelivery);
+
+  $('btnDownloadInspect').addEventListener('click', downloadInspectReport);
 
   $('batchConfirm').addEventListener('click', confirmBatch);
 

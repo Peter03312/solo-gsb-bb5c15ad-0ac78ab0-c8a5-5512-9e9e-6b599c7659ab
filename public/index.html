@@ -64,6 +64,9 @@
         <h2 class="sub-title">敏感信息巡检</h2>
         <div class="hint sub-hint">离线扫描原稿中的手机号、邮箱与 18 位身份证号（身份证校验出生日期与校验位；重叠时身份证＞邮箱＞手机号，同类更长优先）。状态随规则、框选与例外实时重算。</div>
         <div id="inspectFilters" class="inspect-filters"></div>
+        <div class="inspect-export">
+          <button id="btnDownloadInspect" class="btn btn-mini" disabled title="按当前筛选导出最近一次渲染快照的 UTF-8 JSON 报告：逐项记录候选类型、原稿半开区间、原文片段、当前状态与仍泄漏子区间（存在预览投影时附预览区间）。规则或原稿变化后随渲染重新生成；无候选时不可导出">导出巡检报告（UTF-8 JSON）</button>
+        </div>
         <ul id="inspectList" class="inspect-list"></ul>
 
         <h2 class="sub-title">保留原文例外</h2>
